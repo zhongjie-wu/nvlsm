@@ -1,0 +1,7 @@
+/zwu/nvlsm/log/2023-07-01-21-31-29/nvlsm_log
+doOneBenchmarkTest NVMeSSD /data/nvlsm 1024 fillseq 1 /zwu/nvlsm/build/db_bench /zwu/nvlsm/log/2023-07-01-21-31-29/nvlsm_log 1032444
+/zwu/nvlsm/log/2023-07-01-21-31-29/nvlsm_log/NVMeSSD_fillseq_1_1024.log
+/zwu/nvlsm/build/db_bench --benchmarks=fillseq,overwrite,stats --value_size=1024 --db=/data/nvlsm --threads=1 --num=1032444 2>&1 | tee /zwu/nvlsm/log/2023-07-01-21-31-29/nvlsm_log/NVMeSSD_fillseq_1_1024.log
+doOneBenchmarkTest NVMeSSD /data/nvlsm 1024 fillrandom 1 /zwu/nvlsm/build/db_bench /zwu/nvlsm/log/2023-07-01-21-31-29/nvlsm_log 1032444
+/zwu/nvlsm/log/2023-07-01-21-31-29/nvlsm_log/NVMeSSD_fillrandom_1_1024.log
+/zwu/nvlsm/build/db_bench --benchmarks=fillrandom,overwrite,stats --value_size=1024 --db=/data/nvlsm --threads=1 --num=1032444 2>&1 | tee /zwu/nvlsm/log/2023-07-01-21-31-29/nvlsm_log/NVMeSSD_fillrandom_1_1024.log
