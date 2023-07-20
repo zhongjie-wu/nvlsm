@@ -66,6 +66,8 @@ check_cxx_symbol_exists(fdatasync "unistd.h" HAVE_FDATASYNC)
 check_cxx_symbol_exists(F_FULLFSYNC "fcntl.h" HAVE_FULLFSYNC)
 check_cxx_symbol_exists(O_CLOEXEC "fcntl.h" HAVE_O_CLOEXEC)
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   # Disable C++ exceptions.
   string(REGEX REPLACE "/EH[a-z]+" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
@@ -213,6 +215,10 @@ target_sources(leveldb
     "util/status.cc"
     "util/autovector.h"
     "util/heap.h"
+    "util/latest-generator.h"
+    "util/zipf.h"
+    "util/latest-generator.cc"
+    "util/zipf.cc"
      
     # "table_nvm/nvmkvmap.cc"
   # Only CMake 3.3+ supports PUBLIC sources in targets exported by "install".

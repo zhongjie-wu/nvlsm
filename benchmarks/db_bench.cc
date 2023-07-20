@@ -23,6 +23,8 @@
 #include "util/zipf.h"
 #include "util/latest-generator.h"
 
+#include <inttypes.h>
+
 // Comma-separated list of operations to run in the specified order
 //   Actual benchmarks:
 //      fillseq       -- write N values in sequential key order in async mode
@@ -139,6 +141,44 @@ namespace leveldb {
 
 namespace {
 leveldb::Env* g_env = nullptr;
+
+class Duration {
+ public:
+  Duration(uint64_t max_seconds, int64_t max_ops, int64_t ops_per_stage = 0) {
+    max_seconds_ = max_seconds;
+    max_ops_= max_ops;
+    ops_per_stage_ = (ops_per_stage > 0) ? ops_per_stage : max_ops;
+    ops_ = 0;
+    start_at_ = g_env->NowMicros();
+  }
+
+  int64_t GetStage() { return std::min(ops_, max_ops_ - 1) / ops_per_stage_; }
+
+  bool Done(int64_t increment) {
+    if (increment <= 0) increment = 1;    // avoid Done(0) and infinite loops
+    ops_ += increment;
+
+    if (max_seconds_) {
+      // Recheck every appx 1000 ops (exact iff increment is factor of 1000)
+      auto granularity = 1000;
+      if ((ops_ / granularity) != ((ops_ - increment) / granularity)) {
+        uint64_t now = g_env->NowMicros();
+        return ((now - start_at_) / 1000000) >= max_seconds_;
+      } else {
+        return false;
+      }
+    } else {
+      return ops_ > max_ops_;
+    }
+  }
+
+ private:
+  uint64_t max_seconds_;
+  int64_t max_ops_;
+  int64_t ops_per_stage_;
+  int64_t ops_;
+  uint64_t start_at_;
+};
 
 class CountComparator : public Comparator {
  public:
@@ -290,10 +330,10 @@ class Stats {
       double now = g_env->NowMicros();
       double micros = now - last_op_finish_;
       hist_.Add(micros);
-      if (micros > 20000) {
-        std::fprintf(stderr, "long op: %.1f micros%30s\r", micros, "");
-        std::fflush(stderr);
-      }
+      // if (micros > 20000) {
+      //   std::fprintf(stderr, "long op: %.1f micros%30s\r", micros, "");
+      //   std::fflush(stderr);
+      // }
       last_op_finish_ = now;
     }
 
@@ -397,6 +437,7 @@ class Benchmark {
   void PrintHeader() {
     const int kKeySize = 16 + FLAGS_key_prefix;
     PrintEnvironment();
+    std::fprintf(stdout, "WriteBuffSize:       %d bytes\n", FLAGS_write_buffer_size);
     std::fprintf(stdout, "Keys:       %d bytes each\n", kKeySize);
     std::fprintf(
         stdout, "Values:     %d bytes each (%d bytes after compression)\n",
@@ -502,6 +543,63 @@ class Benchmark {
     delete db_;
     delete cache_;
     delete filter_policy_;
+  }
+
+  Slice AllocateKey(std::unique_ptr<const char[]>* key_guard) {
+    char* data = new char[16];
+    const char* const_data = data;
+    key_guard->reset(const_data);
+    return Slice(key_guard->get(), 16);
+  }
+
+  // Generate key according to the given specification and random number.
+  // The resulting key will have the following format (if keys_per_prefix_
+  // is positive), extra trailing bytes are either cut off or padded with '0'.
+  // The prefix value is derived from key value.
+  //   ----------------------------
+  //   | prefix 00000 | key 00000 |
+  //   ----------------------------
+  // If keys_per_prefix_ is 0, the key is simply a binary representation of
+  // random number followed by trailing '0's
+  //   ----------------------------
+  //   |        key 00000         |
+  //   ----------------------------
+  void GenerateKeyFromInt(uint64_t v, int64_t num_keys, Slice* key) {
+    char* start = const_cast<char*>(key->data());
+    char* pos = start;
+
+    // keys_per_prefix is 0 thus this boc not needed
+    //
+    // if (keys_per_prefix_ > 0) {
+    //   int64_t num_prefix = num_keys / keys_per_prefix_;
+    //   int64_t prefix = v % num_prefix;
+    //   int bytes_to_fill = std::min(prefix_size_, 8);
+    //   if (port::kLittleEndian) {
+    //     for (int i = 0; i < bytes_to_fill; ++i) {
+    //       pos[i] = (prefix >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+    //     }
+    //   } else {
+    //     memcpy(pos, static_cast<void*>(&prefix), bytes_to_fill);
+    //   }
+    //   if (prefix_size_ > 8) {
+    //     // fill the rest with 0s
+    //     memset(pos + 8, '0', prefix_size_ - 8);
+    //   }
+    //   pos += prefix_size_;
+    // }
+
+    int bytes_to_fill = std::min(16 - static_cast<int>(pos - start), 8);
+    // if (port::kLittleEndian) {
+    //   for (int i = 0; i < bytes_to_fill; ++i) {
+    //     pos[i] = (v >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+    //   }
+    // } else {
+    memcpy(pos, static_cast<void*>(&v), bytes_to_fill);
+    // }
+    pos += bytes_to_fill;
+    if (16 > pos - start) {
+      memset(pos, '0', 16 - (pos - start));
+    }
   }
 
   void Run() {
@@ -631,7 +729,12 @@ class Benchmark {
       }
 
       if (method != nullptr) {
-        RunBenchmark(num_threads, name, method);
+        if (method == &Benchmark::YCSBFillDB){
+          std::fprintf(stdout, "YCSBFillDB detected, thread fixed to one\n");
+          RunBenchmark(1, name, method);
+        } else {
+          RunBenchmark(num_threads, name, method);
+        }
       }
     }
   }
@@ -1045,14 +1148,17 @@ class Benchmark {
 
   // YCSB Workloads
   void YCSBFillDB(ThreadState* thread) {
-    ReadOptions options(FLAGS_verify_checksum, true);
+    // ReadOptions options(FLAGS_verify_checksum, true);
+    ReadOptions options;
+    options.verify_checksums = true;
+    options.fill_cache=true;
     RandomGenerator gen;
     std::string value;
     int64_t found = 0;
 
     int64_t reads_done = 0;
     int64_t writes_done = 0;
-    Duration duration(FLAGS_duration, FLAGS_num);
+    Duration duration(18446744073709551615, FLAGS_num); //Set to max for fillrandom since use_existing_db is broken
 
     std::unique_ptr<const char[]> key_guard;
     Slice key = AllocateKey(&key_guard);
@@ -1061,24 +1167,24 @@ class Benchmark {
 
     //write in order
     for (long k = 1; k <= FLAGS_num; k++){
-      DB* db = SelectDB(thread);
+      // DB* db = SelectDB(thread);
       GenerateKeyFromInt(k, FLAGS_num, &key);
 
         //write
-        Status s = db->Put(write_options_, key, gen.Generate(value_size));
+        Status s = db_->Put(write_options_, key, gen.Generate(FLAGS_value_size));
         if (!s.ok()) {
           //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           //exit(1);
         }
         writes_done++;
         //printf("K= %d\n", k);
-        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        thread->stats.FinishedSingleOp(); // thread->stats.FinishedOps(nullptr, db, 1, kWrite);
     }    
 
     char msg[100];
     snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
              " total:%" PRIu64 " found:%" PRIu64 ")",
-             reads_done, writes_done, readwrites_, found);
+             reads_done, writes_done, num_, found);
     thread->stats.AddMessage(msg);
   }
 
@@ -1091,7 +1197,11 @@ class Benchmark {
   // Default data size: 1 KB records 
   // Request distribution: zipfian
   void YCSBWorkloadA(ThreadState* thread) {
-    ReadOptions options(FLAGS_verify_checksum, true);
+    int64_t FLAGS_duration = 1800;
+    // ReadOptions options(FLAGS_verify_checksum, true);
+    ReadOptions options;
+    options.verify_checksums = true;
+    options.fill_cache=true;
     RandomGenerator gen;
     init_latestgen(FLAGS_num);
     init_zipf_generator(0, FLAGS_num);
@@ -1108,7 +1218,7 @@ class Benchmark {
 
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
-      DB* db = SelectDB(thread);
+      // DB* db = SelectDB(thread);
 
           long k;
           if (FLAGS_YCSB_uniform_distribution){
@@ -1123,7 +1233,7 @@ class Benchmark {
           int next_op = thread->rand.Next() % 100;
           if (next_op < 50){
             //read
-            Status s = db->Get(options, key, &value);
+            Status s = db_->Get(options, key, &value);
             if (!s.ok() && !s.IsNotFound()) {
               //fprintf(stderr, "k=%d; get error: %s\n", k, s.ToString().c_str());
               //exit(1);
@@ -1131,19 +1241,19 @@ class Benchmark {
               // find more errors if any
             } else if (!s.IsNotFound()) {
               found++;
-              thread->stats.FinishedOps(nullptr, db, 1, kRead);
+              thread->stats.FinishedSingleOp();// thread->stats.FinishedOps(nullptr, db, 1, kRead);
             }
             reads_done++;
 
           } else{
 
-            Status s = db->Put(write_options_, key, gen.Generate(value_size));
+            Status s = db_->Put(write_options_, key, gen.Generate(FLAGS_value_size));
             if (!s.ok()) {
               //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
               //exit(1);
             } else{
              writes_done++;
-             thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+             thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kWrite);
             }                
       }
 
@@ -1153,7 +1263,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
              " total:%" PRIu64 " found:%" PRIu64 ")",
-             reads_done, writes_done, readwrites_, found);
+             reads_done, writes_done, reads_done+writes_done, found);
     thread->stats.AddMessage(msg);
   }
 
@@ -1167,7 +1277,11 @@ class Benchmark {
   // Default data size: 1 KB records 
   // Request distribution: zipfian
   void YCSBWorkloadB(ThreadState* thread) {
-    ReadOptions options(FLAGS_verify_checksum, true);
+    int64_t FLAGS_duration = 900;
+    // ReadOptions options(FLAGS_verify_checksum, true);
+    ReadOptions options;
+    options.verify_checksums = true;
+    options.fill_cache=true;
     RandomGenerator gen;
     init_latestgen(FLAGS_num);
     init_zipf_generator(0, FLAGS_num);
@@ -1185,7 +1299,7 @@ class Benchmark {
 
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
-      DB* db = SelectDB(thread);
+      // DB* db = SelectDB(thread);
 
       long k;
       if (FLAGS_YCSB_uniform_distribution){
@@ -1200,27 +1314,27 @@ class Benchmark {
       int next_op = thread->rand.Next() % 100;
       if (next_op < 95){
         //read
-        Status s = db->Get(options, key, &value);
+        Status s = db_->Get(options, key, &value);
         if (!s.ok() && !s.IsNotFound()) {
           //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
           // we continue after error rather than exiting so that we can
           // find more errors if any
         } else if (!s.IsNotFound()) {
           found++;
-          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+          thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kRead);
         }
         reads_done++;
 
       } else{
         //write
-        Status s = db->Get(options, key, &value);
-        s = db->Put(write_options_, key, gen.Generate(value_size));
+        Status s = db_->Get(options, key, &value);
+        s = db_->Put(write_options_, key, gen.Generate(FLAGS_value_size));
         if (!s.ok()) {
           //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           //exit(1);
         } else{
             writes_done++;
-            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+            thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kWrite);
         }
       }
 
@@ -1228,7 +1342,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
              " total:%" PRIu64 " found:%" PRIu64 ")",
-             reads_done, writes_done, readwrites_, found);
+             reads_done, writes_done, reads_done+writes_done, found);
     thread->stats.AddMessage(msg);
   }
 
@@ -1240,7 +1354,11 @@ class Benchmark {
   // Default data size: 1 KB records 
   // Request distribution: zipfian
   void YCSBWorkloadC(ThreadState* thread) {
-    ReadOptions options(FLAGS_verify_checksum, true);
+    int64_t FLAGS_duration = 1800;
+    // ReadOptions options(FLAGS_verify_checksum, true);
+    ReadOptions options;
+    options.verify_checksums = true;
+    options.fill_cache=true;
     RandomGenerator gen;
     init_latestgen(FLAGS_num);
     init_zipf_generator(0, FLAGS_num);
@@ -1258,7 +1376,7 @@ class Benchmark {
 
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
-      DB* db = SelectDB(thread);
+      // DB* db = SelectDB(thread);
 
       long k;
       if (FLAGS_YCSB_uniform_distribution){
@@ -1271,14 +1389,14 @@ class Benchmark {
       GenerateKeyFromInt(k, FLAGS_num, &key);
 
       //read
-      Status s = db->Get(options, key, &value);
+      Status s = db_->Get(options, key, &value);
       if (!s.ok() && !s.IsNotFound()) {
         fprintf(stderr, "get error: %s\n", s.ToString().c_str());
         // we continue after error rather than exiting so that we can
         // find more errors if any
       } else if (!s.IsNotFound()) {
         found++;
-        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kRead);
       }
       reads_done++;
 
@@ -1288,7 +1406,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
              " total:%" PRIu64 " found:%" PRIu64 ")",
-             reads_done, writes_done, readwrites_, found);
+             reads_done, writes_done, reads_done+writes_done, found);
     thread->stats.AddMessage(msg);
   }
 
@@ -1307,7 +1425,11 @@ class Benchmark {
   // which orders items purely by time, and demands the latest, is very different than 
   // workload here (which we believe is more typical of how people build systems.)
   void YCSBWorkloadD(ThreadState* thread) {
-    ReadOptions options(FLAGS_verify_checksum, true);
+    int64_t FLAGS_duration = 900;
+    // ReadOptions options(FLAGS_verify_checksum, true);
+    ReadOptions options;
+    options.verify_checksums = true;
+    options.fill_cache=true;
     RandomGenerator gen;
     init_latestgen(FLAGS_num);
     init_zipf_generator(0, FLAGS_num);
@@ -1325,7 +1447,7 @@ class Benchmark {
 
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
-      DB* db = SelectDB(thread);
+      // DB* db = SelectDB(thread);
 
 
       long k;
@@ -1341,26 +1463,26 @@ class Benchmark {
       int next_op = thread->rand.Next() % 100;
       if (next_op < 95){
         //read
-        Status s = db->Get(options, key, &value);
+        Status s = db_->Get(options, key, &value);
         if (!s.ok() && !s.IsNotFound()) {
           //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
           // we continue after error rather than exiting so that we can
           // find more errors if any
         } else if (!s.IsNotFound()) {
           found++;
-          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+          thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kRead);
         }
         reads_done++;
 
       } else{
         //write
-        Status s = db->Put(write_options_, key, gen.Generate(value_size));
+        Status s = db_->Put(write_options_, key, gen.Generate(FLAGS_value_size));
         if (!s.ok()) {
           //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           //exit(1);
         } else{
             writes_done++;
-            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+            thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kWrite);
         }
       }
 
@@ -1368,7 +1490,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
              " total:%" PRIu64 " found:%" PRIu64 ")",
-             reads_done, writes_done, readwrites_, found);
+             reads_done, writes_done, reads_done+writes_done, found);
     thread->stats.AddMessage(msg);
 
   }
@@ -1392,8 +1514,11 @@ class Benchmark {
   // client works is that it will pick a start
   // key, and then request a number of records; this works fine even for hashed insertion.
   void YCSBWorkloadE(ThreadState* thread) {
-
-    ReadOptions options(FLAGS_verify_checksum, true);
+    int64_t FLAGS_duration = 900;
+    // ReadOptions options(FLAGS_verify_checksum, true);
+    ReadOptions options;
+    options.verify_checksums = true;
+    options.fill_cache=true;
     RandomGenerator gen;
     init_latestgen(FLAGS_num);
     init_zipf_generator(0, FLAGS_num);
@@ -1411,7 +1536,7 @@ class Benchmark {
 
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
-      DB* db = SelectDB(thread);
+      // DB* db = SelectDB(thread);
 
       long k;
       if (FLAGS_YCSB_uniform_distribution){
@@ -1432,7 +1557,7 @@ class Benchmark {
         //for now, scan lenght constant
         int scan_length = thread->rand.Next() % 100;
 
-        Iterator* iter = db->NewIterator(options);
+        Iterator* iter = db_->NewIterator(options);
         int64_t i = 0;
         int64_t bytes = 0;
         for (iter->Seek(key); i < 100 && iter->Valid(); iter->Next()) {
@@ -1445,16 +1570,16 @@ class Benchmark {
         delete iter;
 
         reads_done++;
-        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kRead);
       } else{
         //write
-        Status s = db->Put(write_options_, key, gen.Generate(value_size));
+        Status s = db_->Put(write_options_, key, gen.Generate(FLAGS_value_size));
         if (!s.ok()) {
           //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           //exit(1);
         } else{
             writes_done++;
-            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+            thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kWrite);
         }
       }
 
@@ -1462,7 +1587,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
              " total:%" PRIu64 " found:%" PRIu64 ")",
-             reads_done, writes_done, readwrites_, found);
+             reads_done, writes_done, reads_done+writes_done, found);
     thread->stats.AddMessage(msg);
 
 
@@ -1480,7 +1605,11 @@ class Benchmark {
   // Request distribution: zipfian
 
   void YCSBWorkloadF(ThreadState* thread) {
-    ReadOptions options(FLAGS_verify_checksum, true);
+    int64_t FLAGS_duration = 900;
+    // ReadOptions options(FLAGS_verify_checksum, true);
+    ReadOptions options;
+    options.verify_checksums = true;
+    options.fill_cache=true;
     RandomGenerator gen;
     init_latestgen(FLAGS_num);
     init_zipf_generator(0, FLAGS_num);
@@ -1498,7 +1627,7 @@ class Benchmark {
 
     // the number of iterations is the larger of read_ or write_
     while (!duration.Done(1)) {
-      DB* db = SelectDB(thread);
+      // DB* db = SelectDB(thread);
 
       long k;
       if (FLAGS_YCSB_uniform_distribution){
@@ -1513,27 +1642,27 @@ class Benchmark {
       int next_op = thread->rand.Next() % 100;
       if (next_op < 50){
         //read
-        Status s = db->Get(options, key, &value);
+        Status s = db_->Get(options, key, &value);
         if (!s.ok() && !s.IsNotFound()) {
           //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
           // we continue after error rather than exiting so that we can
           // find more errors if any
         } else if (!s.IsNotFound()) {
           found++;
-          thread->stats.FinishedOps(nullptr, db, 1, kRead);
+          thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kRead);
         }
         reads_done++;
 
       } else{
         //read-modify-write.
-        Status s = db->Get(options, key, &value);
-        s = db->Put(write_options_, key, gen.Generate(value_size));
+        Status s = db_->Get(options, key, &value);
+        s = db_->Put(write_options_, key, gen.Generate(FLAGS_value_size));
         if (!s.ok()) {
           //fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           //exit(1);
         } else{
             writes_done++;
-            thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+            thread->stats.FinishedSingleOp();//thread->stats.FinishedOps(nullptr, db, 1, kWrite);
         }
       }
 
@@ -1541,7 +1670,7 @@ class Benchmark {
     char msg[100];
     snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
              " total:%" PRIu64 " found:%" PRIu64 ")",
-             reads_done, writes_done, readwrites_, found);
+             reads_done, writes_done, reads_done+writes_done, found);
     thread->stats.AddMessage(msg);
   }
 
